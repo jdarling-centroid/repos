@@ -1,0 +1,514 @@
+#!/bin/bash
+
+set -o errexit -o pipefail -o nounset
+
+trap 'echo "FATAL: line=${LINENO} cmd=${BASH_COMMAND} exit=$?" >&2' ERR
+
+declare SCRIPT_NAME="${0##*/}"
+declare SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+declare WORK_DIR="$(pwd -P)"
+declare CLONE_ROOT="${WORK_DIR}"
+declare CLONE_ROOT_SET="false"
+declare DEFAULT_REPOS_FILE=""
+declare CURRENT_CLI_ORG=""
+declare DRY_RUN="false"
+declare GITHUB_USER=""
+declare GH_TOOL=""
+declare EXPLICIT_REPO_SOURCE="false"
+declare UPDATED_COUNT="0"
+declare CLONED_COUNT="0"
+declare SKIPPED_COUNT="0"
+declare FAILED_COUNT="0"
+
+declare -a SOURCE_EVENTS=()
+declare -a REPOSITORIES=()
+
+function showHelp() {
+  local exitCode="${1:-0}"
+  local errorMessage="${2:-}"
+
+  echo "Usage: ${SCRIPT_NAME} [options]"
+  echo ""
+  echo "Clone missing repositories and pull existing repositories."
+  echo ""
+  echo "Options:"
+  echo "  --clone-root <path>   Directory where repositories are cloned or updated"
+  echo "  --org <name>          Set organization for later --repo values"
+  echo "  --repo <value>        Add a repository; may be repeated"
+  echo "  --repos-file <path>   Read repositories from a file; may be repeated"
+  echo "  --github-user <name>  Switch GitHub CLI user before git operations"
+  echo "  --dry-run             Print commands without running them"
+  echo "  -h, --help            Show this help message"
+  echo ""
+  echo "Repo values:"
+  echo "  repo"
+  echo "  repo=localPath"
+  echo "  org/repo"
+  echo "  org/repo=localPath"
+  echo ""
+  echo "Examples:"
+  echo "  ${SCRIPT_NAME}"
+  echo "  ${SCRIPT_NAME} --dry-run"
+  echo "  ${SCRIPT_NAME} --clone-root ~/projects --org my-org --repo app"
+  echo "  ${SCRIPT_NAME} --repo my-org/app --repo other-org/tool=tools/tool"
+  echo "  ${SCRIPT_NAME} --repos-file ./repos"
+
+  if [ -n "${errorMessage}" ]; then
+    echo ""
+    echo "FATAL: ${errorMessage}" >&2
+  fi
+
+  exit "${exitCode}"
+}
+
+function fatal() {
+  local message="$1"
+
+  echo "FATAL: ${message}" >&2
+  exit 1
+}
+
+function requireFlagValue() {
+  local flagName="$1"
+  local value="${2:-}"
+
+  [ -n "${value}" ] || showHelp 1 "${flagName} requires a value"
+}
+
+function trim() {
+  local raw="$1"
+
+  printf '%s' "${raw}" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+function expandPath() {
+  local rawPath="$1"
+
+  case "${rawPath}" in
+    "~")
+      echo "${HOME}"
+      ;;
+    "~/"*)
+      echo "${HOME}/${rawPath#"~/"}"
+      ;;
+    *)
+      echo "${rawPath}"
+      ;;
+  esac
+}
+
+function parseArgs() {
+  local value=""
+
+  while [[ $# > 0 ]]; do
+    case "$1" in
+      --clone-root)
+        requireFlagValue "$1" "${2:-}"
+        [ "${CLONE_ROOT_SET}" = "false" ] || showHelp 1 "--clone-root may only be supplied once"
+        CLONE_ROOT="$(expandPath "$(trim "$2")")"
+        CLONE_ROOT_SET="true"
+        shift 2
+        ;;
+      --org)
+        requireFlagValue "$1" "${2:-}"
+        value="$(trim "$2")"
+        [ -n "${value}" ] || showHelp 1 "--org requires a non-empty value"
+        SOURCE_EVENTS[${#SOURCE_EVENTS[@]}]="org	${value}"
+        shift 2
+        ;;
+      --repo)
+        requireFlagValue "$1" "${2:-}"
+        value="$(trim "$2")"
+        [ -n "${value}" ] || showHelp 1 "--repo requires a non-empty value"
+        SOURCE_EVENTS[${#SOURCE_EVENTS[@]}]="repo	${value}"
+        EXPLICIT_REPO_SOURCE="true"
+        shift 2
+        ;;
+      --repos-file)
+        requireFlagValue "$1" "${2:-}"
+        value="$(expandPath "$(trim "$2")")"
+        [ -n "${value}" ] || showHelp 1 "--repos-file requires a non-empty value"
+        SOURCE_EVENTS[${#SOURCE_EVENTS[@]}]="file	${value}"
+        EXPLICIT_REPO_SOURCE="true"
+        shift 2
+        ;;
+      --github-user)
+        requireFlagValue "$1" "${2:-}"
+        GITHUB_USER="$(trim "$2")"
+        [ -n "${GITHUB_USER}" ] || showHelp 1 "--github-user requires a non-empty value"
+        shift 2
+        ;;
+      --dry-run)
+        DRY_RUN="true"
+        shift
+        ;;
+      -h|--help)
+        showHelp 0
+        ;;
+      *)
+        showHelp 1 "Unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+function validateInputs() {
+  command -v git >/dev/null 2>&1 || fatal "git is required"
+  [ -d "${CLONE_ROOT}" ] || fatal "Clone root not found: ${CLONE_ROOT}"
+
+  if [ -n "${GITHUB_USER}" ]; then
+    if [ -x "${SCRIPT_DIR}/gh" ]; then
+      GH_TOOL="${SCRIPT_DIR}/gh"
+      return
+    fi
+
+    GH_TOOL="$(command -v gh || true)"
+    [ -n "${GH_TOOL}" ] || fatal "gh is required when --github-user is provided"
+  fi
+}
+
+function validateLocalPath() {
+  local localPath="$1"
+  local sourceLabel="$2"
+
+  [ -n "${localPath}" ] || fatal "${sourceLabel}: local path cannot be empty"
+
+  case "${localPath}" in
+    /*)
+      fatal "${sourceLabel}: local path must be relative: ${localPath}"
+      ;;
+    *\\*)
+      fatal "${sourceLabel}: local path must not contain backslashes: ${localPath}"
+      ;;
+    */)
+      fatal "${sourceLabel}: local path must not end with /: ${localPath}"
+      ;;
+    ".."|../*|*/..|*/../*)
+      fatal "${sourceLabel}: local path must not contain .. segments: ${localPath}"
+      ;;
+  esac
+}
+
+function appendRepoEntry() {
+  local orgName="$(trim "$1")"
+  local repoName="$(trim "$2")"
+  local localPath="$(trim "$3")"
+  local sourceLabel="$4"
+
+  [ -n "${orgName}" ] || fatal "${sourceLabel}: organization cannot be empty"
+  [ -n "${repoName}" ] || fatal "${sourceLabel}: repository name cannot be empty"
+  validateLocalPath "${localPath}" "${sourceLabel}"
+
+  REPOSITORIES[${#REPOSITORIES[@]}]="${orgName}	${repoName}	${localPath}"
+}
+
+function parseCliRepoValue() {
+  local rawValue="$(trim "$1")"
+  local sourceLabel="$2"
+  local repoPart="${rawValue}"
+  local localPath=""
+  local orgName="${CURRENT_CLI_ORG}"
+  local repoName=""
+
+  [ -n "${rawValue}" ] || fatal "${sourceLabel}: repository value cannot be empty"
+
+  case "${rawValue}" in
+    *=*)
+      repoPart="$(trim "${rawValue%%=*}")"
+      localPath="$(trim "${rawValue#*=}")"
+      [ -n "${localPath}" ] || fatal "${sourceLabel}: local path cannot be empty"
+      ;;
+  esac
+
+  case "${repoPart}" in
+    */*)
+      orgName="$(trim "${repoPart%%/*}")"
+      repoName="$(trim "${repoPart#*/}")"
+      ;;
+    *)
+      repoName="$(trim "${repoPart}")"
+      ;;
+  esac
+
+  [ -n "${localPath}" ] || localPath="${repoName}"
+  appendRepoEntry "${orgName}" "${repoName}" "${localPath}" "${sourceLabel}"
+}
+
+function parseFileRepoValue() {
+  local rawValue="$(trim "$1")"
+  local orgName="$2"
+  local sourceLabel="$3"
+  local repoName="${rawValue}"
+  local localPath=""
+
+  [ -n "${orgName}" ] || fatal "${sourceLabel}: repository entry found before [org] section"
+  [ -n "${rawValue}" ] || fatal "${sourceLabel}: repository value cannot be empty"
+
+  case "${rawValue}" in
+    *=*)
+      repoName="$(trim "${rawValue%%=*}")"
+      localPath="$(trim "${rawValue#*=}")"
+      [ -n "${localPath}" ] || fatal "${sourceLabel}: local path cannot be empty"
+      ;;
+  esac
+
+  case "${repoName}" in
+    */*)
+      fatal "${sourceLabel}: repo files do not support org/repo syntax: ${repoName}"
+      ;;
+  esac
+
+  [ -n "${localPath}" ] || localPath="${repoName}"
+  appendRepoEntry "${orgName}" "${repoName}" "${localPath}" "${sourceLabel}"
+}
+
+function appendReposFromFile() {
+  local reposFile="$(expandPath "$(trim "$1")")"
+  local line=""
+  local lineNumber="0"
+  local fileOrg=""
+  local orgName=""
+  local sourceLabel=""
+
+  [ -f "${reposFile}" ] || fatal "Repos file not found: ${reposFile}"
+  [ -r "${reposFile}" ] || fatal "Repos file is not readable: ${reposFile}"
+
+  while read -r line || [ -n "${line}" ]; do
+    lineNumber="$((lineNumber + 1))"
+    line="$(trim "${line}")"
+    sourceLabel="${reposFile}:${lineNumber}"
+
+    if [ -z "${line}" ]; then
+      continue
+    fi
+
+    if [[ "${line}" == \#* ]]; then
+      continue
+    fi
+
+    case "${line}" in
+      \[*\])
+        orgName="$(trim "${line#\[}")"
+        orgName="$(trim "${orgName%\]}")"
+        [ -n "${orgName}" ] || fatal "${sourceLabel}: organization section cannot be empty"
+        fileOrg="${orgName}"
+        continue
+        ;;
+      org=*)
+        fatal "${sourceLabel}: repo files use [org] sections, not org= entries"
+        ;;
+    esac
+
+    parseFileRepoValue "${line}" "${fileOrg}" "${sourceLabel}"
+  done < "${reposFile}"
+}
+
+function appendDefaultReposFile() {
+  DEFAULT_REPOS_FILE="${CLONE_ROOT}/repos"
+  [ -f "${DEFAULT_REPOS_FILE}" ] || fatal "Default repos file not found: ${DEFAULT_REPOS_FILE}"
+  appendReposFromFile "${DEFAULT_REPOS_FILE}"
+}
+
+function processSourceEvents() {
+  local event=""
+  local eventType=""
+  local eventValue=""
+
+  CURRENT_CLI_ORG="${CLONE_ROOT##*/}"
+
+  if [ "${EXPLICIT_REPO_SOURCE}" = "false" ]; then
+    appendDefaultReposFile
+    return
+  fi
+
+  for event in "${SOURCE_EVENTS[@]}"; do
+    eventType="${event%%	*}"
+    eventValue="${event#*	}"
+
+    case "${eventType}" in
+      org)
+        CURRENT_CLI_ORG="${eventValue}"
+        ;;
+      repo)
+        parseCliRepoValue "${eventValue}" "--repo ${eventValue}"
+        ;;
+      file)
+        appendReposFromFile "${eventValue}"
+        ;;
+      *)
+        fatal "Unknown source event type: ${eventType}"
+        ;;
+    esac
+  done
+}
+
+function sortRepositories() {
+  local repoEntry=""
+  local -a sortedRepositories=()
+
+  if [ "${#REPOSITORIES[@]}" -eq 0 ]; then
+    return
+  fi
+
+  while read -r repoEntry || [ -n "${repoEntry}" ]; do
+    sortedRepositories[${#sortedRepositories[@]}]="${repoEntry}"
+  done < <(printf '%s\n' "${REPOSITORIES[@]}" | LC_ALL=C sort -u)
+
+  REPOSITORIES=("${sortedRepositories[@]}")
+}
+
+function validateRepositories() {
+  local entry=""
+  local existingEntry=""
+  local localPath=""
+  local existingLocalPath=""
+
+  [ "${#REPOSITORIES[@]}" -gt 0 ] || fatal "No repositories configured"
+
+  sortRepositories
+
+  for entry in "${REPOSITORIES[@]}"; do
+    localPath="${entry##*	}"
+
+    for existingEntry in "${REPOSITORIES[@]}"; do
+      [ "${entry}" != "${existingEntry}" ] || continue
+      existingLocalPath="${existingEntry##*	}"
+
+      if [ "${localPath}" = "${existingLocalPath}" ]; then
+        fatal "Local path collision for ${localPath}: ${entry} conflicts with ${existingEntry}"
+      fi
+    done
+  done
+}
+
+function runCommand() {
+  local -a command=("$@")
+
+  if [ "${DRY_RUN}" = "true" ]; then
+    printf '[dry-run]'
+    printf ' %q' "${command[@]}"
+    echo ""
+    return 0
+  fi
+
+  "${command[@]}"
+}
+
+function switchGithubUser() {
+  if [ -z "${GITHUB_USER}" ]; then
+    return
+  fi
+
+  echo "[+] Switching GitHub CLI user to ${GITHUB_USER}"
+  runCommand "${GH_TOOL}" auth switch --user "${GITHUB_USER}"
+}
+
+function createParentDir() {
+  local repoPath="$1"
+  local parentDir="${repoPath%/*}"
+
+  if [ "${parentDir}" = "${repoPath}" ]; then
+    return 0
+  fi
+
+  if [ -d "${parentDir}" ]; then
+    return 0
+  fi
+
+  runCommand mkdir -p "${parentDir}"
+}
+
+function updateRepo() {
+  local orgName="$1"
+  local repoName="$2"
+  local repoPath="$3"
+
+  echo "[+] Pulling ${orgName}/${repoName}"
+  runCommand git -C "${repoPath}" pull --ff-only
+}
+
+function cloneRepo() {
+  local orgName="$1"
+  local repoName="$2"
+  local localPath="$3"
+  local cloneUrl="git@github.com:${orgName}/${repoName}.git"
+
+  echo "[+] Cloning ${orgName}/${repoName}"
+  runCommand git -C "${CLONE_ROOT}" clone "${cloneUrl}" "${localPath}"
+}
+
+function processRepo() {
+  local repoEntry="$1"
+  local orgName=""
+  local repoName=""
+  local localPath=""
+  local repoPath=""
+
+  orgName="${repoEntry%%	*}"
+  repoEntry="${repoEntry#*	}"
+  repoName="${repoEntry%%	*}"
+  localPath="${repoEntry#*	}"
+  repoPath="${CLONE_ROOT}/${localPath}"
+
+  if [ -d "${repoPath}/.git" ]; then
+    if updateRepo "${orgName}" "${repoName}" "${repoPath}"; then
+      UPDATED_COUNT="$((UPDATED_COUNT + 1))"
+      return
+    fi
+
+    echo "ERROR: failed to pull ${orgName}/${repoName} at ${repoPath}" >&2
+    FAILED_COUNT="$((FAILED_COUNT + 1))"
+    return
+  fi
+
+  if [ -e "${repoPath}" ]; then
+    echo "WARN: skipping ${orgName}/${repoName}: path exists but is not a git repository: ${repoPath}"
+    SKIPPED_COUNT="$((SKIPPED_COUNT + 1))"
+    return
+  fi
+
+  if ! createParentDir "${repoPath}"; then
+    echo "ERROR: failed to create parent directory for ${orgName}/${repoName}: ${repoPath}" >&2
+    FAILED_COUNT="$((FAILED_COUNT + 1))"
+    return
+  fi
+
+  if cloneRepo "${orgName}" "${repoName}" "${localPath}"; then
+    CLONED_COUNT="$((CLONED_COUNT + 1))"
+    return
+  fi
+
+  echo "ERROR: failed to clone ${orgName}/${repoName} to ${repoPath}" >&2
+  FAILED_COUNT="$((FAILED_COUNT + 1))"
+}
+
+function processRepos() {
+  local repoEntry=""
+
+  for repoEntry in "${REPOSITORIES[@]}"; do
+    processRepo "${repoEntry}"
+  done
+}
+
+function printSummary() {
+  echo ""
+  echo "[+] Done"
+  echo "    clone root: ${CLONE_ROOT}"
+  echo "    updated:    ${UPDATED_COUNT}"
+  echo "    cloned:     ${CLONED_COUNT}"
+  echo "    skipped:    ${SKIPPED_COUNT}"
+  echo "    failed:     ${FAILED_COUNT}"
+  echo "    started:    ${WORK_DIR}"
+}
+
+parseArgs "$@"
+validateInputs
+processSourceEvents
+validateRepositories
+switchGithubUser
+processRepos
+printSummary
+
+if [ "${FAILED_COUNT}" -gt 0 ]; then
+  exit 1
+fi

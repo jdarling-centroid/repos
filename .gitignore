@@ -1,0 +1,21 @@
+# macOS metadata
+.DS_Store
+
+# Editor and shell scratch files
+*.swp
+*.swo
+*~
+
+# Local logs and temporary output
+*.log
+*.tmp
+
+# Optional local GitHub CLI binary used by --github-user lookup.
+/gh
+
+# Clone outputs from the checked-in sample repos file.
+/api/
+/web-app/
+/services/
+/shared-tools/
+/another-org-api/

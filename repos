@@ -1,0 +1,46 @@
+# Sample repository definitions for updateRepos.
+#
+# Copy this file to your clone root as "repos" and replace the sample org and
+# repo names with real values.
+#
+# Format:
+#   [org-name]
+#   repo-name
+#   repo-name=relative/local/path
+#
+# Rules:
+#   - Blank lines are ignored.
+#   - Lines starting with # are ignored.
+#   - Repo entries must appear after an [org-name] section.
+#   - repo=path clones repo-name into <clone-root>/path.
+#   - Paths must be relative and must not contain "..".
+#   - Inline comments are not supported.
+
+[your-org]
+
+# Clone into <clone-root>/api
+api
+
+# Clone into <clone-root>/web-app
+frontend=web-app
+
+# Clone into a relative subdirectory.
+worker=services/worker
+
+[another-org]
+
+# Multiple org sections are allowed.
+shared-tools
+
+# The same repo name from a different org is allowed only when the local path is unique.
+api=another-org-api
+
+# Invalid examples:
+# repo-before-section
+# org/repo
+# org/repo=local-path
+# org=your-org
+# bad-path=../outside
+# bad-absolute-path=/tmp/repo
+# bad-empty-path=
+# trailing-slash=some/path/
