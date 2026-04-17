@@ -22,3 +22,12 @@
 
 .password
 password
+
+.token
+token
+
+.secret
+secret
+
+.credential
+credential
