@@ -1,191 +1,160 @@
 # updateRepos
 
-`updateRepos` is a portable Bash tool for cloning and updating GitHub
-repositories by SSH.
+`updateRepos` clones missing GitHub repositories and updates existing ones.
 
-This project is implemented from [PLAN.md](PLAN.md). The current `repos` file
-is a sample repository definition file.
-
-## Repository Layout
+It is meant for keeping a local folder of related GitHub repos current. It uses
+SSH clone URLs only:
 
 ```text
-.
-├── AGENTS.md
-├── PLAN.md
-├── README.md
-├── repos
-├── standards/
-│   ├── README.md
-│   └── coding/
-│       └── bash.md
-└── updateRepos
+git@github.com:<org>/<repo>.git
 ```
 
 ## Requirements
 
 - Bash
 - Git
-- SSH access to the target GitHub organization
-- Optional: GitHub CLI (`gh`) when using `--github-user`
+- SSH access to the GitHub repositories you want to clone
+- GitHub CLI (`gh`) only if you use `--github-user`
 
-The script is intended to run on macOS and Ubuntu. Do not assume `rg` is
-installed.
+The script supports macOS and Ubuntu, including the older Bash version that
+ships with macOS.
 
-## Repositories File
+## Quick Start
 
-The default repository file path is:
+Preview what would happen:
+
+```bash
+./updateRepos --dry-run --org my-org --repo app
+```
+
+Clone or update that repo:
+
+```bash
+./updateRepos --org my-org --repo app
+```
+
+Use a repo list file:
+
+```bash
+./updateRepos --repos-file ./repos
+```
+
+By default, repos are cloned under the current directory. Use `--clone-root` to
+choose a different destination:
+
+```bash
+./updateRepos --clone-root ~/projects --repos-file ./repos
+```
+
+## Repo Lists
+
+If you run `./updateRepos` without `--repo` or `--repos-file`, it reads:
 
 ```text
 <clone-root>/repos
 ```
 
-The checked-in `repos` file is a sample template:
+The file is grouped by GitHub organization:
 
 ```text
-# Sample repository definitions for updateRepos.
-#
-# Copy this file to your clone root as "repos" and replace the sample org and
-# repo names with real values.
-#
-# Format:
-#   [org-name]
-#   repo-name
-#   repo-name=relative/local/path
-
-[your-org]
-
-# Clone into <clone-root>/api
+[my-org]
 api
-
-# Clone into <clone-root>/web-app
 frontend=web-app
-
-# Clone into a relative subdirectory.
 worker=services/worker
 
 [another-org]
-
-# Multiple org sections are allowed.
 shared-tools
-
-# The same repo name from a different org is allowed only when the local path is unique.
 api=another-org-api
 ```
 
-Format:
-
-- Blank lines are ignored.
-- Lines where the trimmed line starts with `#` are ignored.
-- `[org-name]` starts an organization section.
-- `repo` clones to `<clone-root>/repo`.
-- `repo=localPath` clones to `<clone-root>/localPath`.
-- Whitespace around `=` is allowed and trimmed.
-- Whitespace inside `[ org ]` is allowed and trimmed.
-- Repo entries before the first `[org]` section are fatal errors.
-- Inline comments are not supported.
-
-## Usage
-
-```bash
-./updateRepos [options]
-```
-
-Options:
-
-```text
---clone-root <path>    Directory where repositories are cloned or updated.
---org <name>           Set organization for later --repo values.
---repo <value>         Add a repository; may be repeated.
---repos-file <path>    Read repositories from a file; may be repeated.
---github-user <name>   Switch GitHub CLI user before git operations.
---dry-run              Print commands instead of executing them.
--h, --help             Show help.
-```
-
-`--repo` supports:
+Each entry is either:
 
 ```text
 repo
-repo=localPath
-org/repo
-org/repo=localPath
+repo=local/path
 ```
 
-## Examples
+For example, `frontend=web-app` clones `git@github.com:my-org/frontend.git`
+into `<clone-root>/web-app`.
 
-Use `<clone-root>/repos`. By default, clone root is the current directory:
+Rules:
+
+- Blank lines are ignored.
+- Full-line comments starting with `#` are ignored.
+- Repo entries must appear under an `[org]` section.
+- Inline comments are not supported.
+- Local paths must be relative.
+- Local paths cannot contain `..`, backslashes, or end with `/`.
+- Repo list files do not support `org/repo`; use `[org]` sections instead.
+
+## Command-Line Repos
+
+`--repo` is useful for one-off runs:
 
 ```bash
-./updateRepos
+./updateRepos --org my-org --repo app
+./updateRepos --org my-org --repo frontend=web-app
+./updateRepos --repo my-org/app
+./updateRepos --repo my-org/frontend=web-app
 ```
 
-Preview work without running commands:
+When `--repo app` does not include an organization, the current `--org` value is
+used. If no `--org` was supplied, the basename of the clone root is used.
+
+Supplying any `--repo` or `--repos-file` skips the default `<clone-root>/repos`
+file.
+
+## GitHub Users
+
+Use `--github-user` when you need to switch the active GitHub CLI account before
+processing repos:
 
 ```bash
-./updateRepos --dry-run
+./updateRepos --github-user my-user --repos-file ./repos
 ```
 
-Use a specific clone root:
+This runs:
 
 ```bash
-./updateRepos --clone-root ~/my-projects
+gh auth switch --user my-user
 ```
 
-Process explicit repositories:
+When this flag is used, `updateRepos` first looks for an executable `gh` next to
+the script, then falls back to `gh` from `PATH`. It does not run
+`gh auth setup-git`, and it does not change clone URLs to HTTPS.
 
-```bash
-./updateRepos --org my-org --repo app --repo api=services/api
+## What It Does
+
+For each configured repo:
+
+- If the local path is already a Git repository, it runs `git pull --ff-only`.
+- If the local path exists but is not a Git repository, it prints `WARN:` and
+  skips it.
+- If the local path does not exist, it clones the repo.
+
+Clone, pull, and parent-directory creation failures print `ERROR:` and the run
+continues with the next repo. Fatal validation problems print `FATAL:` and stop
+before any repo is processed.
+
+## Options
+
+```text
+--clone-root <path>    Directory where repositories are cloned or updated
+--org <name>           Set organization for later --repo values
+--repo <value>         Add a repository; may be repeated
+--repos-file <path>    Read repositories from a file; may be repeated
+--github-user <name>   Switch GitHub CLI user before git operations
+--dry-run              Print commands instead of running them
+-h, --help             Show help
 ```
 
-Use explicit org/repo syntax:
+## Checks
 
-```bash
-./updateRepos --repo my-org/app --repo other-org/tooling=tools/tooling
-```
-
-Read repositories from a custom file:
-
-```bash
-./updateRepos --repos-file ./team-repos
-```
-
-Switch GitHub CLI user before processing:
-
-```bash
-./updateRepos --github-user my-github-user
-```
-
-When `--github-user` is used, `updateRepos` looks for `gh` next to the
-`updateRepos` script first, then falls back to `gh` from `PATH`.
-
-## Operational Notes
-
-- Clone URLs are SSH-only:
-
-  ```text
-  git@github.com:<org>/<repo>.git
-  ```
-
-- Existing Git repositories are updated with `git pull --ff-only`.
-- Existing paths that are not Git repositories are skipped with `WARN:`.
-- Per-repo clone, pull, and parent-directory creation failures print `ERROR:`
-  and continue.
-- Fatal validation errors print `FATAL:` and stop before repository processing.
-- Summary includes updated, cloned, skipped, and failed counts.
-- If any repo fails, the script exits `1` after the summary.
-
-## Validation
-
-Syntax check:
+Run these before changing the script:
 
 ```bash
 bash -n updateRepos
-```
-
-Dry-run examples:
-
-```bash
-./updateRepos --dry-run
 ./updateRepos --dry-run --org my-org --repo app
+./updateRepos --dry-run --repo my-org/app=my-local-app
 ./updateRepos --dry-run --repos-file ./repos
 ```
